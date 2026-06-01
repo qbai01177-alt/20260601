@@ -74,7 +74,7 @@ class Obstacle {
     return this.x < -100;
   }
 
-  // 💥 AABB 碰撞偵測優化 (縮小 20% 碰撞箱提高體感容錯率)
+  // AABB 碰撞偵測優化 (縮小 20% 碰撞箱提高體感容錯率)
   collidesWith(p) {
     let tolerance = 0.8;
     let pLX = p.x + p.w * (1 - tolerance);
@@ -110,33 +110,22 @@ class Particle {
   }
 }
 
-
 // ----------------------------------------------------
 // 核心 p5.js 函式 (Main p5.js Functions)
 // ----------------------------------------------------
-
 function setup() {
   // 建立全螢幕畫布
   createCanvas(windowWidth, windowHeight);
   player.y = height - 100 - player.h;
   player.targetY = player.y;
 
-  // 初始化視訊並隱藏預設 HTML 元素
-  video = createCapture(VIDEO, { flipped: true });
+  // 1. 初始化視訊串流
+  video = createCapture(VIDEO);
   video.size(640, 480);
   video.hide();
 
-  // 載入 ml5.js faceMesh 模型
-  faceMesh = ml5.faceMesh(video, FACEMESH_OPTIONS, () => {
-    console.log("FaceMesh 模型載入成功！");
-    modelLoaded = true;
-    gameState = GAME_STATES.CALIBRATION; // 進入校正提示畫面
-  });
-
-  // 持續監聽臉部辨識結果 (非同步)
-  faceMesh.on("predict", (results) => {
-    faces = results;
-  });
+  // 2. 使用 ml5 v1.x 標準的非同步載入機制，綁定 modelReady 回呼函式
+  faceMesh = ml5.faceMesh(video, FACEMESH_OPTIONS, modelReady);
 
   // 讀取本地最高分紀錄
   if (localStorage.getItem("cyberGasp_highScore")) {
@@ -144,11 +133,28 @@ function setup() {
   }
 }
 
+// 模型就緒後的處理函式
+function modelReady() {
+  console.log("FaceMesh 模型載入成功！");
+  modelLoaded = true;
+  gameState = GAME_STATES.CALIBRATION; // 安全進入校正提示畫面
+  
+  // 3. 模型確認就緒後，正式開啟臉部偵測監聽
+  faceMesh.detectStart(video, gotFaces);
+}
+
+// 接收最新 AI 臉部辨識數據
+function gotFaces(results) {
+  faces = results;
+}
+
 function draw() {
   background(10, 10, 25); // 賽博朋克深紫夜空背景
   
-  // 繪製全螢幕背景裝飾：隱約的科技風視訊畫面（低透明度保護隱私）
+  // 繪製全螢幕背景裝飾：隱約的科技風視訊畫面（低透明度保護隱私、內建水平翻轉視覺）
   push();
+  translate(width, 0);
+  scale(-1, 1);
   tint(0, 180, 255, 30);
   image(video, 0, 0, width, height);
   pop();
@@ -159,6 +165,7 @@ function draw() {
   line(0, height - 100, width, height - 100);
   noStroke();
   fill(15, 15, 40);
+  rectMode(CENTER);
   rect(width/2, height - 50, width, 100);
 
   // 核心場景狀態流控制
@@ -178,7 +185,7 @@ function draw() {
 }
 
 // ----------------------------------------------------
-// 🎮 遊戲核心邏輯
+// 🎮 遊戲核心邏輯 (gameState = PLAYING)
 // ----------------------------------------------------
 function playGame() {
   score += 0.1; // 隨著存活時間增加分數
@@ -205,7 +212,7 @@ function handleFaceInput() {
     let face = faces[0];
     drawMiniFaceRadar(face);
 
-    // 提取關鍵點：最新版 ml5.faceMesh 唇部邊緣通常為 index 13（上唇）與 14（下唇）
+    // 提取核心特徵點：最新版 ml5.faceMesh 唇部邊緣固定為 index 13（上唇）與 14（下唇）
     let topLip = face.keypoints[13];
     let botLip = face.keypoints[14];
 
@@ -257,10 +264,10 @@ function updateAndDrawObstacles() {
     obs.draw();
 
     if (obs.collidesWith(player)) {
-      // 撞擊！觸發全螢幕大爆炸粒子並結束遊戲
+      // 💥 撞擊！觸發全螢幕大爆炸粒子並結束遊戲
       createExplosion(player.x + player.w / 2, player.y + player.h / 2, color(255, 255, 0), 40);
       endGame();
-      return; // 遊戲結束，停止處理後續障礙物
+      return; 
     }
 
     // 移出螢幕外執行記憶體清除，防止網格卡頓崩潰
@@ -296,31 +303,32 @@ function drawCalibrationScreen() {
   fill(20, 20, 45, 200);
   stroke(0, 255, 255);
   strokeWeight(2);
-  rect(width / 2, height / 2, 550, 160, 10);
+  rect(width / 2, height / 2, 550, 180, 10);
   noStroke();
 
   fill(200, 255, 255);
   textSize(18);
   if (!isCalibrating) {
-    text("🎮 遊戲玩法：對著鏡頭【張大嘴巴】控制主角跳躍", width / 2, height / 2 - 40);
-    text("請將手機調整為平視高度，確保面部清晰", width / 2, height / 2 - 10);
+    text("🎮 遊戲玩法：對著鏡頭【張大嘴巴】控制主角跳躍", width / 2, height / 2 - 50);
+    text("請將手機調整為平視高度，確保面部清晰", width / 2, height / 2 - 20);
+    fill(255, 255, 0);
+    text("💡 提示：若辨識不穩，可在本畫面按鍵盤【S】快速強制作戰", width / 2, height / 2 + 10);
     
-    // 閃爍的提示按鈕
+    // 點擊按鈕
     fill(255, 0, 128, 150 + sin(frameCount * 0.1) * 100);
-    rect(width / 2, height / 2 + 45, 240, 45, 5);
+    rect(width / 2, height / 2 + 55, 240, 45, 5);
     fill(255);
     textSize(20);
-    text("點擊此處進行面部校正", width / 2, height / 2 + 45);
+    text("點擊此處進行面部校正", width / 2, height / 2 + 55);
   } else {
-    // 如果有校正錯誤訊息，顯示它
+    // 顯示校正錯誤訊息
     if (calibrationError) {
       fill(255, 100, 100);
       textSize(16);
-      text(calibrationError, width / 2, height / 2 + 85);
-      noFill();
+      text(calibrationError, width / 2, height / 2 + 65);
     }
 
-    // 正在進行 3 秒校正計時
+    // 進行 3 秒校正計時
     let elapsed = (millis() - calibrationTimer) / 1000;
     fill(0, 255, 255);
     textSize(24);
@@ -336,7 +344,6 @@ function drawCalibrationScreen() {
     }
 
     if (elapsed >= 3) {
-      // 計算平均值作為閉嘴基礎值
       if (lipDistHistory.length > 0) {
         let sum = 0;
         for (let d of lipDistHistory) sum += d;
@@ -346,9 +353,8 @@ function drawCalibrationScreen() {
         obstacles = [];
         nextObstacleFrame = frameCount + 60;
       } else {
-        // 如果沒偵測到臉，重來
         isCalibrating = false;
-        calibrationError = "未偵測到完整面部，請調整鏡頭後重新點擊校正！";
+        calibrationError = "❌ 未偵測到面部，請確保手機鏡頭已連線！";
       }
     }
   }
@@ -357,13 +363,11 @@ function drawCalibrationScreen() {
 function drawPlayer() {
   push();
   translate(player.x, player.y);
-  // 繪製帶有霓虹發光感的小戰機/像素主角
   stroke(0, 255, 255);
   strokeWeight(2);
   fill(20, 40, 80);
   rectMode(CORNER);
   rect(0, 0, player.w, player.h, 4);
-  // 戰機核心發光艙艙
   noStroke();
   fill(0, 255, 255, 180 + sin(frameCount * 0.2) * 70);
   ellipse(player.w/2, player.h/3, 15, 15);
@@ -372,21 +376,19 @@ function drawPlayer() {
 
 function drawMiniFaceRadar(face) {
   push();
-  // 位於左上角的科技小懸浮視窗
   fill(10, 10, 30, 220);
   stroke(0, 255, 255, 150);
   rectMode(CORNER);
   rect(20, 20, 110, 90, 5);
   
-  // 繪製極簡科技面部網格骨架
+  // 縮小版雷達拓撲結構
   translate(20, 20);
-  scale(110 / 640, 90 / 480); // 等比例縮小至雷達視窗
+  scale(110 / 640, 90 / 480); 
   noStroke();
   fill(0, 255, 255);
   for (let kp of face.keypoints) {
     ellipse(kp.x, kp.y, 4);
   }
-  // 高亮標註上下唇點
   fill(255, 255, 0);
   if(face.keypoints[13]) ellipse(face.keypoints[13].x, face.keypoints[13].y, 12);
   if(face.keypoints[14]) ellipse(face.keypoints[14].x, face.keypoints[14].y, 12);
@@ -419,7 +421,6 @@ function drawGameOverScreen() {
   fill(0, 255, 255);
   text("太空紀錄保持: " + floor(highScore), width / 2, height / 2 + 35);
   
-  // 重來按鈕
   rectMode(CENTER);
   fill(40, 40, 60);
   stroke(0, 255, 255);
@@ -432,10 +433,9 @@ function drawGameOverScreen() {
 
 function drawPauseScreen() {
   if (faces.length > 0) {
-    gameState = GAME_STATES.PLAYING; // 檢測到臉部回到感應區，自動續玩
+    gameState = GAME_STATES.PLAYING; // 臉部回來了，自動續玩
   }
   
-  // 紅色閃爍出界警告框
   stroke(255, 0, 80, 120 + sin(frameCount * 0.15) * 100);
   strokeWeight(6);
   noFill();
@@ -453,9 +453,8 @@ function drawPauseScreen() {
 }
 
 // ----------------------------------------------------
-// 💥 獨立二維特效粒子系統 (Particle System)
+// 💥 特效系統 (Explosion System)
 // ----------------------------------------------------
-
 function createExplosion(x, y, col, count) {
   for (let i = 0; i < count; i++) {
     particles.push(new Particle(x, y, col, random(-4, 4), random(-4, 4)));
@@ -471,7 +470,7 @@ function updateAndDrawParticles() {
 }
 
 // ----------------------------------------------------
-// 🖱 點擊按鈕事件範圍檢驗
+// 🖱 按鈕滑鼠範圍檢查與點擊控制
 // ----------------------------------------------------
 function isMouseInCenterRect(cx, cy, w, h) {
   return mouseX > cx - w / 2 && mouseX < cx + w / 2 &&
@@ -482,19 +481,29 @@ function mousePressed() {
   if (!modelLoaded) return;
 
   if (gameState === GAME_STATES.CALIBRATION && !isCalibrating) {
-    // 點擊校正按鈕區
-    if (isMouseInCenterRect(width / 2, height / 2 + 45, 240, 45)) {
+    if (isMouseInCenterRect(width / 2, height / 2 + 55, 240, 45)) {
       isCalibrating = true;
       calibrationTimer = millis();
       lipDistHistory = [];
-      calibrationError = ""; // 清除舊的錯誤訊息
+      calibrationError = ""; 
     }
   } else if (gameState === GAME_STATES.GAME_OVER) {
-    // 點擊重新開始按鈕區
     if (isMouseInCenterRect(width / 2, height / 2 + 105, 180, 45)) {
-      gameState = GAME_STATES.CALIBRATION; // 重新回到校正畫面
+      gameState = GAME_STATES.CALIBRATION; 
       isCalibrating = false;
     }
+  }
+}
+
+function keyPressed() {
+  // ⚡【強制作戰快捷鍵】若是在非教室環境下手機測試斷訊，按 S 鍵可以直接以默認值進入遊戲除錯
+  if (gameState === GAME_STATES.CALIBRATION && !isCalibrating && (key === 's' || key === 'S')) {
+    console.log("DEBUG: Skipping calibration, starting game with default values.");
+    baseLipDist = 22; 
+    gameState = GAME_STATES.PLAYING;
+    score = 0;
+    obstacles = [];
+    nextObstacleFrame = frameCount + 60;
   }
 }
 
