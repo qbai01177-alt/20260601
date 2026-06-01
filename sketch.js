@@ -1,380 +1,106 @@
 let video;
-let handpose;
-let predictions = [];
-let modelLoadedFlag = false;
+let faceMesh;
+let faces = [];
+let modelLoaded = false;
 
-// 使用常數物件管理遊戲狀態，提高可讀性與可維護性
-const GAME_STATE = {
-  START: 0,
-  PLAYING: 1,
-  GAME_OVER: 2,
-  PAUSED: 3,
+// 遊戲狀態機
+const GAME_STATES = {
+  LOADING: 0,
+  CALIBRATION: 1,
+  PLAYING: 2,
+  GAME_OVER: 3,
+  PAUSED: 4,
 };
-// 遊戲狀態：0 = 載入/開始畫面, 1 = 遊戲進行中, 2 = 遊戲結束, 3 = 出界暫停
-let gameState = GAME_STATE.START; 
+let gameState = GAME_STATES.LOADING;
+
+// 校正系統變數
+let isCalibrating = false;
+let calibrationTimer = 0;
+let baseLipDist = 0; // 閉嘴時的基準上下唇距離
+let lipDistHistory = [];
+let calibrationError = ""; // 用於在畫面上顯示校正錯誤訊息
+
+// 遊戲平衡參數（張嘴判定比例，可依據測試微調）
+const JUMP_RATIO_THRESHOLD = 1.35;
+const FACEMESH_OPTIONS = { maxFaces: 1, flipped: true };
+
+// 遊戲核心計分與計時
 let score = 0;
 let highScore = 0;
-let timer = 60; // 60秒倒數
-let lastTimerCheck = 0;
-// 飛機與物理參數
-let planeX = 300;
-let planeY = 300;
-let targetX = 300;
-let targetY = 300;
-let easing = 0.15; // lerp 平滑系數
 
-// 武器與冷卻機制
-let bullets = [];
-let lastShotTime = 0;
-let shotCooldown = 300; // 射擊冷卻 300 毫秒
+// 物理系統：玩家（主角）物件
+let player = {
+  x: 100,
+  y: 0,
+  w: 40,
+  h: 50,
+  vy: 0,
+  gravity: 0.7,
+  jumpForce: -15,
+  onGround: false,
+  targetY: 0
+};
 
-// 敵方障礙物（隕石）
-let enemies = [];
-let spawnRate = 45; // 每隔幾影格生成一個敵人
-
-// 特效粒子系統
+// 障礙物與粒子系統
+let obstacles = [];
 let particles = [];
-
-function setup() {
-  createCanvas(640, 480);
-  
-  // 初始化 WebCam 視訊並隱藏預設 HTML 標籤
-  video = createCapture(VIDEO);
-  video.size(width, height);
-  video.hide();
-
-  // 初始化 ml5.js Handpose 模型
-  handpose = ml5.handpose(video, () => {
-    console.log("Handpose 模型載入成功！");
-    modelLoadedFlag = true;
-  });
-
-  // 持續監聽手部辨識結果
-  handpose.on("predict", (results) => {
-    predictions = results;
-  });
-  
-  // 讀取歷史最高分
-  if (localStorage.getItem("sky_highScore")) {
-    highScore = int(localStorage.getItem("sky_highScore"));
-  }
-}
-
-function draw() {
-  background(10);
-  
-  // 1. 繪製背景視訊（霓虹科技感濾鏡 + 鏡像翻轉）
-  push();
-  translate(width, 0);
-  scale(-1, 1);
-  tint(0, 150, 255, 45); // 科技藍調、低透明度保護隱私
-  image(video, 0, 0, width, height);
-  pop();
-
-  // 2. 核心遊戲流程控制器 (Finite State Machine)
-  if (!modelLoadedFlag) {
-    drawLoadingScreen();
-  } else {
-    switch (gameState) {
-      case GAME_STATE.START: // 開始畫面
-        drawStartScreen();
-        break;
-      case GAME_STATE.PLAYING: // 遊戲中
-        playGame();
-        break;
-      case GAME_STATE.GAME_OVER: // 遊戲結束
-        drawGameOverScreen();
-        break;
-      case GAME_STATE.PAUSED: // 手部出界暫停
-        drawPauseScreen();
-        break;
-    }
-  }
-  
-  // 獨立繪製粒子特效（不受遊戲暫停影響，維持流暢感）
-  updateAndDrawParticles();
-}
+let nextObstacleFrame = 0;
 
 // ----------------------------------------------------
-// 🎮 核心遊戲邏輯
+// 💥 類別定義 (Classes)
 // ----------------------------------------------------
-function playGame() {
-  // 處理計時器
-  if (millis() - lastTimerCheck >= 1000) {
-    timer--;
-    lastTimerCheck = millis();
-    if (timer <= 0) {
-      endGame();
-    }
+class Obstacle {
+  constructor(groundY) {
+    this.x = width + 50;
+    this.w = random(20, 40);
+    this.h = random(40, 80);
+    this.y = groundY - this.h; // 確保障礙物底部在地面線上
   }
 
-  // 檢查 AI 是否捕捉到手部數據
-  if (predictions.length > 0) {
-    let hand = predictions[0];
-    
-    // 取得食指根部 (Index 5) 做為飛機操控點
-    // 因為視訊鏡像了，座標 X 軸需要進行翻轉鏡射對齊
-    let rawX = hand.landmarks[5][0];
-    let rawY = hand.landmarks[5][1];
-    targetX = width - rawX; 
-    targetY = rawY;
-
-    // 使用 lerp 達成絲滑流暢的視覺追隨，消除生理手震
-    planeX = lerp(planeX, targetX, easing);
-    planeY = lerp(planeY, targetY, easing);
-
-    // 繪製科技霓虹手部骨架（提供玩家即時視覺回饋）
-    drawHandSkeleton(hand);
-
-    // 檢查手勢：大拇指尖(4) 與 食指尖(8) 的像素距離
-    let thumbTip = hand.landmarks[4];
-    let indexTip = hand.landmarks[8];
-    let pinchDist = dist(width - thumbTip[0], thumbTip[1], width - indexTip[0], indexTip[1]);
-
-    // 捏合判定（距離小於 28 像素）且過了冷卻時間
-    if (pinchDist < 28 && millis() - lastShotTime > shotCooldown) {
-      bullets.push({ x: planeX, y: planeY - 15 });
-      lastShotTime = millis();
-      // 觸發射擊光斑粒子
-      createExplosion(planeX, planeY - 15, color(0, 255, 255), 5);
-    }
-  } else {
-    // ⚠️ 防呆機制：如果遊戲中手移出鏡頭，觸發自動暫停
-    gameState = GAME_STATE.PAUSED;
+  update(speed) {
+    this.x -= speed;
   }
 
-  // 生成敵方障礙物
-  if (frameCount % spawnRate === 0) {
-    enemies.push({
-      x: random(30, width - 30),
-      y: -20,
-      size: random(25, 50),
-      speed: random(2, 5)
-    });
-  }
-
-  // 更新與繪製子彈
-  for (let i = bullets.length - 1; i >= 0; i--) {
-    let b = bullets[i];
-    b.y -= 8; // 子彈向上飛
-    
-    // 繪製霓虹激光子彈
-    noStroke();
-    fill(0, 255, 255);
-    rectMode(CENTER);
-    rect(b.x, b.y, 4, 15, 2);
-    
-    // 出界刪除
-    if (b.y < 0) bullets.splice(i, 1);
-  }
-
-  // 更新與繪製敵方隕石
-  for (let i = enemies.length - 1; i >= 0; i--) {
-    let e = enemies[i];
-    e.y += e.speed;
-
-    // 繪製賽博朋克風敵機/隕石
+  draw() {
     stroke(255, 0, 128);
-    strokeWeight(2);
-    fill(40, 20, 30);
-    ellipse(e.x, e.y, e.size);
-    // 內縮花紋
+    strokeWeight(3);
+    fill(40, 10, 30);
+    rectMode(CORNER);
+    rect(this.x, this.y, this.w, this.h, 5);
     noStroke();
-    fill(255, 0, 128, 100);
-    ellipse(e.x, e.y, e.size * 0.4);
-
-    let wasDestroyed = false;
-    // 碰撞偵測：子彈打中隕石
-    for (let j = bullets.length - 1; j >= 0; j--) {
-      let b = bullets[j];
-      if (dist(b.x, b.y, e.x, e.y) < e.size / 2) {
-        createExplosion(e.x, e.y, color(255, 0, 128), 15);
-        enemies.splice(i, 1);
-        bullets.splice(j, 1);
-        score += 10;
-        wasDestroyed = true;
-        break;
-      }
-    }
-    // 如果隕石已被子彈摧毀，立即處理下一個隕石
-    if (wasDestroyed) continue;
-
-    // 碰撞偵測：隕石撞擊玩家飛機 (縮小飛機碰撞箱至 15 像素提升容錯率)
-    if (dist(planeX, planeY, e.x, e.y) < (e.size / 2 + 15)) {
-      createExplosion(planeX, planeY, color(255, 255, 0), 30);
-      enemies.splice(i, 1);
-      score = max(0, score - 15); // 扣分處罰
-      // 隕石撞到飛機後也消失，立即處理下一個隕石
-      continue;
-    }
-
-    // 漏掉沒打中出界刪除
-    if (e.y > height + 30) {
-      enemies.splice(i, 1);
-    }
   }
 
-  // 繪製玩家控制的「霓虹特技飛機」
-  drawPlayerPlane(planeX, planeY);
-
-  // 顯示上方 UI 數據
-  drawUI();
-}
-
-// ----------------------------------------------------
-// 🎨 各種畫面視覺設計 (UI / Screens)
-// ----------------------------------------------------
-function drawLoadingScreen() {
-  textAlign(CENTER, CENTER);
-  fill(0, 255, 255);
-  textSize(24);
-  text("NEURAL NETWORK LOADING...", width / 2, height / 2 - 20);
-  
-  // 旋轉科技感光圈
-  noFill();
-  stroke(0, 255, 255, 150);
-  strokeWeight(3);
-  ellipse(width / 2, height / 2 + 40, 40 + sin(frameCount * 0.1) * 10);
-}
-
-function drawStartScreen() {
-  textAlign(CENTER, CENTER);
-  // 標題
-  textSize(42);
-  fontWeight(BOLD);
-  fill(255, 255, 255);
-  text("MASTER HAND", width / 2, height / 2 - 60);
-  fill(0, 255, 255);
-  text("SKY ADVENTURE", width / 2, height / 2 - 15);
-  
-  // 說明文字
-  textSize(16);
-  fill(200);
-  text("🖐 舉起手掌控制飛機飛行", width / 2, height / 2 + 50);
-  text("👌 👌 捏合大拇指與食指發射激光", width / 2, height / 2 + 80);
-  
-  // 提示點擊按鈕
-  fill(255, 0, 128);
-  rect(width / 2, height / 2 + 140, 180, 40, 5);
-  fill(255);
-  text("點擊畫布開始", width / 2, height / 2 + 140);
-}
-
-function drawGameOverScreen() {
-  textAlign(CENTER, CENTER);
-  fill(255, 0, 128);
-  textSize(48);
-  text("MISSION OVER", width / 2, height / 2 - 50);
-  
-  fill(255);
-  textSize(20);
-  text("本次得分: " + score, width / 2, height / 2 + 10);
-  fill(0, 255, 255);
-  text("歷史最高紀錄: " + highScore, width / 2, height / 2 + 40);
-  
-  fill(40, 40, 40);
-  rect(width / 2, height / 2 + 110, 180, 40, 5);
-  fill(255);
-  text("再玩一次", width / 2, height / 2 + 110);
-}
-
-function drawPauseScreen() {
-  // 當玩家手移開時的自動暫停頁面
-  if (predictions.length > 0) {
-    gameState = GAME_STATE.PLAYING; // 手回來了，自動繼續遊戲
-  }
-  
-  // 繪製半透明警示紅框
-  stroke(255, 0, 0, sin(frameCount * 0.1) * 150 + 100);
-  strokeWeight(5);
-  noFill();
-  rectMode(CENTER);
-  rect(width/2, height/2, width-10, height-10);
-  
-  textAlign(CENTER, CENTER);
-  noStroke();
-  fill(255, 50, 50);
-  textSize(28);
-  text("⚠️ 偵測不到手部數據 ⚠️", width / 2, height / 2 - 20);
-  textSize(16);
-  fill(255);
-  text("請將手掌移回視訊畫面中央以繼續遊戲", width / 2, height / 2 + 20);
-}
-
-function drawUI() {
-  // 左上角分數與時間
-  textAlign(LEFT, TOP);
-  textSize(18);
-  fill(255);
-  text("SCORE: ", 20, 20);
-  fill(0, 255, 255);
-  text(score, 95, 20);
-  
-  fill(255);
-  text("TIME: ", 20, 45);
-  if (timer < 10) fill(255, 0, 128); // 快沒時間變紅色
-  else fill(0, 255, 255);
-  text(timer + "s", 80, 45);
-}
-
-function drawPlayerPlane(x, y) {
-  push();
-  translate(x, y);
-  
-  // 推進器尾焰效果（動態粒子）
-  if (frameCount % 2 === 0) {
-    particles.push(new Particle(x + random(-5, 5), y + 25, color(255, 100, 0), -1, random(1, 3)));
+  isOffscreen() {
+    return this.x < -100;
   }
 
-  // 飛機機身美術風格：霓虹戰機
-  stroke(0, 255, 255);
-  strokeWeight(2);
-  fill(10, 30, 50);
-  
-  // 機翼
-  triangle(-25, 10, 25, 10, 0, -20);
-  // 核心機艙
-  fill(0, 255, 255, 150);
-  ellipse(0, -5, 10, 20);
-  
-  pop();
-}
+  // 💥 AABB 碰撞偵測優化 (縮小 20% 碰撞箱提高體感容錯率)
+  collidesWith(p) {
+    let tolerance = 0.8;
+    let pLX = p.x + p.w * (1 - tolerance);
+    let pRX = p.x + p.w * tolerance;
+    let pTY = p.y + p.h * (1 - tolerance);
+    let pBY = p.y + p.h;
 
-function drawHandSkeleton(hand) {
-  // 繪製 21 個手部關節點
-  for (let i = 0; i < hand.landmarks.length; i++) {
-    let x = width - hand.landmarks[i][0]; // 水平翻轉
-    let y = hand.landmarks[i][1];
-    
-    noStroke();
-    // 針對控制點（食指根部）與射擊點（指尖）渲染亮色
-    if (i === 5 || i === 4 || i === 8) {
-      fill(255, 255, 0);
-      ellipse(x, y, 9);
-    } else {
-      fill(0, 255, 255, 180);
-      ellipse(x, y, 5);
-    }
+    return (pRX > this.x && pLX < this.x + this.w &&
+            pBY > this.y && pTY < this.y + this.h);
   }
 }
 
-// ----------------------------------------------------
-// 💥 粒子特效系統 (Particle System)
-// ----------------------------------------------------
 class Particle {
-  constructor(x, y, col, speedY, size) {
+  constructor(x, y, col, vy, vx) {
     this.x = x;
     this.y = y;
-    this.vx = random(-2, 2);
-    this.vy = speedY || random(-2, 2);
+    this.vx = vx || random(-1, 1);
+    this.vy = vy || random(-1, 1);
     this.alpha = 255;
     this.col = col;
-    this.size = size || random(4, 8);
+    this.size = random(4, 9);
   }
   update() {
     this.x += this.vx;
     this.y += this.vy;
-    this.alpha -= 8;
+    this.alpha -= 7;
   }
   display() {
     noStroke();
@@ -384,9 +110,355 @@ class Particle {
   }
 }
 
+
+// ----------------------------------------------------
+// 核心 p5.js 函式 (Main p5.js Functions)
+// ----------------------------------------------------
+
+function setup() {
+  // 建立全螢幕畫布
+  createCanvas(windowWidth, windowHeight);
+  player.y = height - 100 - player.h;
+  player.targetY = player.y;
+
+  // 初始化視訊並隱藏預設 HTML 元素
+  video = createCapture(VIDEO, { flipped: true });
+  video.size(640, 480);
+  video.hide();
+
+  // 載入 ml5.js faceMesh 模型
+  faceMesh = ml5.faceMesh(video, FACEMESH_OPTIONS, () => {
+    console.log("FaceMesh 模型載入成功！");
+    modelLoaded = true;
+    gameState = GAME_STATES.CALIBRATION; // 進入校正提示畫面
+  });
+
+  // 持續監聽臉部辨識結果 (非同步)
+  faceMesh.on("predict", (results) => {
+    faces = results;
+  });
+
+  // 讀取本地最高分紀錄
+  if (localStorage.getItem("cyberGasp_highScore")) {
+    highScore = int(localStorage.getItem("cyberGasp_highScore"));
+  }
+}
+
+function draw() {
+  background(10, 10, 25); // 賽博朋克深紫夜空背景
+  
+  // 繪製全螢幕背景裝飾：隱約的科技風視訊畫面（低透明度保護隱私）
+  push();
+  tint(0, 180, 255, 30);
+  image(video, 0, 0, width, height);
+  pop();
+
+  // 繪製地面地平線
+  stroke(0, 255, 255, 100);
+  strokeWeight(4);
+  line(0, height - 100, width, height - 100);
+  noStroke();
+  fill(15, 15, 40);
+  rect(width/2, height - 50, width, 100);
+
+  // 核心場景狀態流控制
+  if (!modelLoaded) {
+    drawLoadingScreen();
+  } else {
+    switch (gameState) {
+      case GAME_STATES.CALIBRATION: drawCalibrationScreen(); break;
+      case GAME_STATES.PLAYING: playGame(); break;
+      case GAME_STATES.GAME_OVER: drawGameOverScreen(); break;
+      case GAME_STATES.PAUSED: drawPauseScreen(); break;
+    }
+  }
+
+  // 獨立更新並繪製粒子系統（確保視覺特效絲滑）
+  updateAndDrawParticles();
+}
+
+// ----------------------------------------------------
+// 🎮 遊戲核心邏輯
+// ----------------------------------------------------
+function playGame() {
+  score += 0.1; // 隨著存活時間增加分數
+
+  handleFaceInput();
+  updatePlayer();
+
+  // 在跑酷前進時，腳底動態噴射霓虹拖曳粒子
+  let groundLine = height - 100;
+  if (player.onGround && frameCount % 3 === 0) {
+    particles.push(new Particle(player.x, groundLine - 2, color(255, 0, 128), random(-3, -1), random(-1, 1)));
+  } else if (!player.onGround) {
+    // 空中噴射尾跡
+    particles.push(new Particle(player.x + player.w/2, player.y + player.h, color(0, 255, 255), random(1, 3), random(-1, 1)));
+  }
+
+  drawPlayer();
+  updateAndDrawObstacles();
+  drawInGameUI();
+}
+
+function handleFaceInput() {
+  if (faces.length > 0) {
+    let face = faces[0];
+    drawMiniFaceRadar(face);
+
+    // 提取關鍵點：最新版 ml5.faceMesh 唇部邊緣通常為 index 13（上唇）與 14（下唇）
+    let topLip = face.keypoints[13];
+    let botLip = face.keypoints[14];
+
+    if (topLip && botLip) {
+      let currentLipDist = dist(topLip.x, topLip.y, botLip.x, botLip.y);
+      let currentRatio = currentLipDist / baseLipDist;
+
+      // ⚠️ 核心機制：當前的唇距比例大於閾值，且主角在地面，即觸發跳躍
+      if (currentRatio > JUMP_RATIO_THRESHOLD && player.onGround) {
+        player.vy = player.jumpForce;
+        player.onGround = false;
+        // 觸發起跳爆發現象粒子
+        createExplosion(player.x + player.w / 2, player.y + player.h, color(0, 255, 255), 15);
+      }
+    }
+  } else {
+    // 防呆機制：如果玩到一半臉移出鏡頭，自動進入出界暫停狀態
+    gameState = GAME_STATES.PAUSED;
+  }
+}
+
+function updatePlayer() {
+  player.vy += player.gravity;
+  player.y += player.vy;
+
+  // 地面碰撞箱鎖定
+  let groundLine = height - 100;
+  if (player.y + player.h >= groundLine) {
+    player.y = groundLine - player.h;
+    player.vy = 0;
+    player.onGround = true;
+  }
+}
+
+function updateAndDrawObstacles() {
+  let currentSpeed = 6 + floor(score / 100);
+  let groundLine = height - 100;
+
+  // 動態生成障礙物
+  if (frameCount > nextObstacleFrame) {
+    obstacles.push(new Obstacle(groundLine));
+    nextObstacleFrame = frameCount + random(60, 120); // 隨機生成間隔
+  }
+
+  // 更新與檢查障礙物
+  for (let i = obstacles.length - 1; i >= 0; i--) {
+    let obs = obstacles[i];
+    obs.update(currentSpeed);
+    obs.draw();
+
+    if (obs.collidesWith(player)) {
+      // 撞擊！觸發全螢幕大爆炸粒子並結束遊戲
+      createExplosion(player.x + player.w / 2, player.y + player.h / 2, color(255, 255, 0), 40);
+      endGame();
+      return; // 遊戲結束，停止處理後續障礙物
+    }
+
+    // 移出螢幕外執行記憶體清除，防止網格卡頓崩潰
+    if (obs.isOffscreen()) {
+      obstacles.splice(i, 1);
+    }
+  }
+}
+
+// ----------------------------------------------------
+// 🎨 介面與視覺場景渲染 (UI & Screens)
+// ----------------------------------------------------
+function drawLoadingScreen() {
+  textAlign(CENTER, CENTER);
+  fill(0, 255, 255);
+  textSize(28);
+  text("🎯 CYBER_PUNK EXPRESSION ENGINE LOADING...", width / 2, height / 2 - 20);
+  noFill();
+  stroke(0, 255, 255, 100);
+  strokeWeight(3);
+  ellipse(width/2, height/2 + 40, 50 + sin(frameCount * 0.1) * 15);
+}
+
+function drawCalibrationScreen() {
+  textAlign(CENTER, CENTER);
+  rectMode(CENTER);
+  
+  fill(255);
+  textSize(46);
+  text("CYBER GASP: NEON RUNNER", width / 2, height / 2 - 120);
+  
+  // 灰色半透明說明背板
+  fill(20, 20, 45, 200);
+  stroke(0, 255, 255);
+  strokeWeight(2);
+  rect(width / 2, height / 2, 550, 160, 10);
+  noStroke();
+
+  fill(200, 255, 255);
+  textSize(18);
+  if (!isCalibrating) {
+    text("🎮 遊戲玩法：對著鏡頭【張大嘴巴】控制主角跳躍", width / 2, height / 2 - 40);
+    text("請將手機調整為平視高度，確保面部清晰", width / 2, height / 2 - 10);
+    
+    // 閃爍的提示按鈕
+    fill(255, 0, 128, 150 + sin(frameCount * 0.1) * 100);
+    rect(width / 2, height / 2 + 45, 240, 45, 5);
+    fill(255);
+    textSize(20);
+    text("點擊此處進行面部校正", width / 2, height / 2 + 45);
+  } else {
+    // 如果有校正錯誤訊息，顯示它
+    if (calibrationError) {
+      fill(255, 100, 100);
+      textSize(16);
+      text(calibrationError, width / 2, height / 2 + 85);
+      noFill();
+    }
+
+    // 正在進行 3 秒校正計時
+    let elapsed = (millis() - calibrationTimer) / 1000;
+    fill(0, 255, 255);
+    textSize(24);
+    text("🤖 面部黃金比例掃描中... 請維持面無表情", width / 2, height / 2 - 20);
+    textSize(42);
+    fill(255, 255, 0);
+    text(max(0, ceil(3 - elapsed)) + "s", width / 2, height / 2 + 30);
+
+    // 收集校正期間的唇距數據
+    if (faces.length > 0 && faces[0].keypoints[13] && faces[0].keypoints[14]) {
+      let d = dist(faces[0].keypoints[13].x, faces[0].keypoints[13].y, faces[0].keypoints[14].x, faces[0].keypoints[14].y);
+      lipDistHistory.push(d);
+    }
+
+    if (elapsed >= 3) {
+      // 計算平均值作為閉嘴基礎值
+      if (lipDistHistory.length > 0) {
+        let sum = 0;
+        for (let d of lipDistHistory) sum += d;
+        baseLipDist = sum / lipDistHistory.length;
+        gameState = GAME_STATES.PLAYING; // 校正完畢，立刻開局！
+        score = 0;
+        obstacles = [];
+        nextObstacleFrame = frameCount + 60;
+      } else {
+        // 如果沒偵測到臉，重來
+        isCalibrating = false;
+        calibrationError = "未偵測到完整面部，請調整鏡頭後重新點擊校正！";
+      }
+    }
+  }
+}
+
+function drawPlayer() {
+  push();
+  translate(player.x, player.y);
+  // 繪製帶有霓虹發光感的小戰機/像素主角
+  stroke(0, 255, 255);
+  strokeWeight(2);
+  fill(20, 40, 80);
+  rectMode(CORNER);
+  rect(0, 0, player.w, player.h, 4);
+  // 戰機核心發光艙艙
+  noStroke();
+  fill(0, 255, 255, 180 + sin(frameCount * 0.2) * 70);
+  ellipse(player.w/2, player.h/3, 15, 15);
+  pop();
+}
+
+function drawMiniFaceRadar(face) {
+  push();
+  // 位於左上角的科技小懸浮視窗
+  fill(10, 10, 30, 220);
+  stroke(0, 255, 255, 150);
+  rectMode(CORNER);
+  rect(20, 20, 110, 90, 5);
+  
+  // 繪製極簡科技面部網格骨架
+  translate(20, 20);
+  scale(110 / 640, 90 / 480); // 等比例縮小至雷達視窗
+  noStroke();
+  fill(0, 255, 255);
+  for (let kp of face.keypoints) {
+    ellipse(kp.x, kp.y, 4);
+  }
+  // 高亮標註上下唇點
+  fill(255, 255, 0);
+  if(face.keypoints[13]) ellipse(face.keypoints[13].x, face.keypoints[13].y, 12);
+  if(face.keypoints[14]) ellipse(face.keypoints[14].x, face.keypoints[14].y, 12);
+  pop();
+}
+
+function drawInGameUI() {
+  textAlign(RIGHT, TOP);
+  textSize(22);
+  fill(255);
+  text("SCORE: ", width - 110, 25);
+  fill(0, 255, 255);
+  text(floor(score), width - 30, 25);
+
+  textAlign(LEFT, TOP);
+  textSize(14);
+  fill(150, 200, 255);
+  text("⚡ 基準唇距: " + floor(baseLipDist) + "px", 150, 30);
+}
+
+function drawGameOverScreen() {
+  textAlign(CENTER, CENTER);
+  fill(255, 0, 128);
+  textSize(54);
+  text("MISSION OVER", width / 2, height / 2 - 60);
+  
+  fill(255);
+  textSize(22);
+  text("本次得分: " + floor(score), width / 2, height / 2);
+  fill(0, 255, 255);
+  text("太空紀錄保持: " + floor(highScore), width / 2, height / 2 + 35);
+  
+  // 重來按鈕
+  rectMode(CENTER);
+  fill(40, 40, 60);
+  stroke(0, 255, 255);
+  rect(width / 2, height / 2 + 105, 180, 45, 5);
+  noStroke();
+  fill(255);
+  textSize(18);
+  text("點擊按鈕重回戰場", width / 2, height / 2 + 105);
+}
+
+function drawPauseScreen() {
+  if (faces.length > 0) {
+    gameState = GAME_STATES.PLAYING; // 檢測到臉部回到感應區，自動續玩
+  }
+  
+  // 紅色閃爍出界警告框
+  stroke(255, 0, 80, 120 + sin(frameCount * 0.15) * 100);
+  strokeWeight(6);
+  noFill();
+  rectMode(CENTER);
+  rect(width/2, height/2, width - 12, height - 12);
+  
+  textAlign(CENTER, CENTER);
+  noStroke();
+  fill(255, 50, 50);
+  textSize(32);
+  text("⚠️ FACE OUT OF BOUNDS ⚠️", width / 2, height / 2 - 20);
+  textSize(18);
+  fill(230);
+  text("請將面部對準手機鏡頭中央以解凍遊戲", width / 2, height / 2 + 25);
+}
+
+// ----------------------------------------------------
+// 💥 獨立二維特效粒子系統 (Particle System)
+// ----------------------------------------------------
+
 function createExplosion(x, y, col, count) {
   for (let i = 0; i < count; i++) {
-    particles.push(new Particle(x, y, col));
+    particles.push(new Particle(x, y, col, random(-4, 4), random(-4, 4)));
   }
 }
 
@@ -394,47 +466,48 @@ function updateAndDrawParticles() {
   for (let i = particles.length - 1; i >= 0; i--) {
     particles[i].update();
     particles[i].display();
-    if (particles[i].alpha <= 0) {
-      particles.splice(i, 1);
-    }
+    if (particles[i].alpha <= 0) particles.splice(i, 1);
   }
 }
 
 // ----------------------------------------------------
-// 🖱 遊戲滑鼠點擊控制事件
+// 🖱 點擊按鈕事件範圍檢驗
 // ----------------------------------------------------
+function isMouseInCenterRect(cx, cy, w, h) {
+  return mouseX > cx - w / 2 && mouseX < cx + w / 2 &&
+         mouseY > cy - h / 2 && mouseY < cy + h / 2;
+}
+
 function mousePressed() {
-  if (!modelLoadedFlag) return;
+  if (!modelLoaded) return;
 
-  if (gameState === GAME_STATE.START) {
-    // 點擊開始遊戲按鈕區域
-    if (mouseX > width / 2 - 90 && mouseX < width / 2 + 90 &&
-        mouseY > height / 2 + 120 && mouseY < height / 2 + 160) {
-      startGame();
+  if (gameState === GAME_STATES.CALIBRATION && !isCalibrating) {
+    // 點擊校正按鈕區
+    if (isMouseInCenterRect(width / 2, height / 2 + 45, 240, 45)) {
+      isCalibrating = true;
+      calibrationTimer = millis();
+      lipDistHistory = [];
+      calibrationError = ""; // 清除舊的錯誤訊息
     }
-  } else if (gameState === GAME_STATE.GAME_OVER) {
-    // 點擊重新開始按鈕區域
-    if (mouseX > width / 2 - 90 && mouseX < width / 2 + 90 &&
-        mouseY > height / 2 + 90 && mouseY < height / 2 + 130) {
-      startGame();
+  } else if (gameState === GAME_STATES.GAME_OVER) {
+    // 點擊重新開始按鈕區
+    if (isMouseInCenterRect(width / 2, height / 2 + 105, 180, 45)) {
+      gameState = GAME_STATES.CALIBRATION; // 重新回到校正畫面
+      isCalibrating = false;
     }
   }
-}
-
-function startGame() {
-  score = 0;
-  timer = 60;
-  bullets = [];
-  enemies = [];
-  gameState = GAME_STATE.PLAYING;
-  lastTimerCheck = millis();
 }
 
 function endGame() {
-  gameState = GAME_STATE.GAME_OVER;
-  // 更新最高分紀錄到瀏覽器 LocalStorage
+  gameState = GAME_STATES.GAME_OVER;
   if (score > highScore) {
     highScore = score;
-    localStorage.setItem("sky_highScore", highScore);
+    localStorage.setItem("cyberGasp_highScore", highScore);
   }
+}
+
+// ⚠️ 全螢幕自動縮放響應式支援 (RWD)
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+  player.y = height - 100 - player.h;
 }
